@@ -1,0 +1,13 @@
+# In Terraform, providers aren't automatically inherited by modules if they have a custom source (like gavinbunney).
+# Root module knows where to find kubectl, but module_addons is still looking for a version from HashiCorp and failing.
+terraform {
+  required_providers {
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = ">= 1.14.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+    }
+  }
+}

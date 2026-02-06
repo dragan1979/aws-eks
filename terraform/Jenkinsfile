@@ -1,0 +1,145 @@
+import groovy.json.JsonOutput
+pipeline {
+    agent any 
+    environment {
+        // This matches the [profile roles-anywhere] in your ~/.aws/config
+        AWS_PROFILE = 'roles-anywhere'
+        AWS_REGION  = 'eu-central-1'
+    }
+    stages {
+        stage('Static Analysis') {
+            parallel {
+                stage('Terraform Format') {
+                    steps {
+                        // -check returns a non-zero exit code if files aren't formatted
+                        sh '''
+                        cd terraform
+                        terraform fmt -check -recursive
+                        '''
+                    }
+                }
+                stage('Terraform Validate') {
+                    steps {
+                        // Validates syntax and internal consistency
+                        // Note: Requires 'init' to be run first or can be run per module
+                        dir('terraform/module_eks') { sh 'terraform init -backend=false && terraform validate' }
+                        dir('terraform/module_addons') { sh 'terraform init -backend=false && terraform validate' }
+                    }
+                }
+            }
+        }
+
+       stage('Security Scan') {
+        steps {
+            dir('terraform') { 
+                script {
+                    // Run the scan and capture the exit status
+                    // We don't use catchError here so we can control the logic
+                    def status = sh(
+                        script: """
+                            docker run --rm -v \$(pwd):/src aquasec/trivy config \
+                            --severity HIGH,CRITICAL \
+                            --exit-code 1 \
+                            --format template \
+                            --template "@contrib/junit.tpl" \
+                            --output /src/trivy-results.xml \
+                            /src
+                        """,
+                        returnStatus: true
+                    )
+
+                    archiveArtifacts artifacts: 'trivy-results.xml', allowEmptyArchive: true
+                    if (fileExists('trivy-results.xml')) { junit 'trivy-results.xml' }
+
+                    if (status == 0) {
+                        echo "✅ No High/Critical security issues found."
+                    } else if (status == 1) {
+                        // This means the scan RAN, but found vulnerabilities
+                        unstable("⚠️ Security vulnerabilities found. Review the report.")
+                    } else {
+                        // This means Docker crashed or the command was invalid
+                        error("❌ Security Scan failed to execute (Exit Code: ${status}). Pipeline stopped.")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Plan') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform init'
+                    sh 'terraform plan -out=tfplan'
+                }
+            }
+        }
+
+        
+
+   stage('Post Plan to PR') {
+    when { changeRequest() }
+    steps {
+        dir('terraform') {
+            script {
+                // 1. Prepare the Plan Text
+                sh "terraform show -no-color tfplan > plan_output.txt"
+                def plan = readFile('plan_output.txt').trim()
+                if (plan.length() > 5000) {
+                    plan = plan.substring(0, 5000) + "\n... (Plan truncated)"
+                }
+
+                // 2. Prepare the Payload and URL in Groovy (Safe)
+                def commentBody = "### 🏗️ Terraform Plan Summary\n\n```hcl\n${plan}\n```"
+                def jsonPayload = JsonOutput.toJson([body: commentBody])
+                
+                // Get Owner/Repo from the environment safely
+                def repoPath = env.GIT_URL.replace("https://github.com/", "").replace(".git", "")
+                def apiUrl = "https://api.github.com/repos/${repoPath}/issues/${env.CHANGE_ID}/comments"
+
+                // 3. Post using withCredentials
+                withCredentials([string(credentialsId: 'github-token', variable: 'TOKEN')]) {
+                    // We use single quotes for the -d flag to prevent the shell 
+                    // from trying to interpret anything inside the JSON
+                    sh "curl -X POST -H 'Authorization: token ${TOKEN}' -H 'Accept: application/vnd.github.v3+json' ${apiUrl} -d '${jsonPayload}'"
+                }
+            }
+        }
+    }
+}
+   stage('Approval Gate') {
+            // ONLY run this if we are on the master branch
+            when {
+                branch 'master'
+            }
+            steps {
+                script {
+                    timeout(time: 1, unit: 'HOURS') {
+                        input message: "Do you want to apply the changes to MASTER?", 
+                              ok: "Deploy to AWS"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when { branch 'master' }
+            steps {
+                dir('terraform') {
+                    // This is the actual command that creates the EKS cluster and avoids hanging issues. It applies the plan we created in the Plan stage.
+                    sh 'terraform apply -auto-approve -input=false tfplan'
+                }
+            }
+                    
+                    }
+    
+    }
+    post {
+    always {
+        // Clean up the plan files so sensitive data doesn't sit on the Jenkins agent
+        sh 'rm -f terraform/tfplan terraform/plan_output.txt'
+    }
+    failure {
+        echo "❌ Deployment failed. Check the logs for AWS/Terraform errors."
+    }
+}
+}
